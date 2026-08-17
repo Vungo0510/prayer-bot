@@ -53,10 +53,12 @@ VERSES = [
 # ---------- telegram helpers ----------
 def tg(method, **kwargs):
     r = requests.post(f"{API}/{method}", json=kwargs, timeout=30)
-    r.raise_for_status()
-    data = r.json()
+    try:
+        data = r.json()
+    except ValueError:
+        raise RuntimeError(f"Telegram API non-JSON response ({r.status_code}): {r.text[:200]}")
     if not data.get("ok"):
-        raise RuntimeError(f"Telegram API error: {data}")
+        raise RuntimeError(f"Telegram API error {data.get('error_code')}: {data.get('description')}")
     return data["result"]
 
 
@@ -294,11 +296,17 @@ def startup():
     except Exception:
         log.exception("getMe failed (bad BOT_TOKEN?)")
         return
-    try:
-        tg("setWebhook", url=f"{PUBLIC_URL}/webhook", secret_token=WEBHOOK_SECRET, drop_pending_updates=False)
-        log.info("webhook set to %s/webhook", PUBLIC_URL)
-    except Exception:
-        log.exception("setWebhook failed (check PUBLIC_URL)")
+    # Retry: on PaaS the instance may not be routable for a few seconds after boot,
+    # and Telegram validates reachability when setting the webhook.
+    for attempt in range(1, 6):
+        try:
+            tg("setWebhook", url=f"{PUBLIC_URL}/webhook", secret_token=WEBHOOK_SECRET, drop_pending_updates=False)
+            log.info("webhook set to %s/webhook (attempt %d)", PUBLIC_URL, attempt)
+            return
+        except Exception as e:
+            log.warning("setWebhook attempt %d/5 failed: %s — retrying in 10s", attempt, e)
+            time.sleep(10)
+    log.error("giving up on setWebhook after 5 attempts (check PUBLIC_URL / logs)")
 
 
 startup()
