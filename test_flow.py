@@ -21,10 +21,10 @@ def fake_tg(method, **kw):
 def fake_sheet(action, **fields):
     sheet_calls.append((action, fields))
     if action == "add":
-        return {"ok": True, "no": 7}
+        return {"ok": True, "no": 7, "date": "17 Aug 2026"}
     if action == "recent":
         return {"ok": True, "items": [
-            {"no": 7, "name": "Grace", "topic": "health", "request": "Mum's surgery <on> Friday", "update": "", "support": "check in"},
+            {"no": 7, "name": "Grace", "topic": "health", "request": "Mum's surgery <on> Friday", "update": "", "support": "check in", "date": "17 Aug 2026"},
         ]}
     raise AssertionError("unexpected action")
 
@@ -45,7 +45,7 @@ def last_text(chat_id=None):
 
 # --- 1. full flow: named user, shares with group ---
 msg("/start")
-assert bot.pending[111]["step"] == bot.ASK_NAME and "call you" in last_text()
+assert bot.pending[111]["step"] == bot.ASK_NAME and ("address you" in last_text() or "call you" in last_text())
 msg("Grace")
 assert bot.pending[111]["step"] == bot.ASK_TOPIC
 msg("health")
@@ -64,6 +64,7 @@ dm = last_text(111)
 assert "#7" in dm and ("—" in dm), dm                      # confirmation + verse
 grp = last_text("-100999")  # env var is a string
 assert "Grace" in grp and "health" in grp and "surgery" in grp, grp
+assert "📅 17 Aug 2026" in grp, grp
 
 # --- 2. anonymous user, private only, HTML escaping ---
 msg("/start", chat_id=222, user_id=222)
@@ -84,6 +85,7 @@ assert grp_after is not None  # group msg from user 1 still the latest (user 2 k
 msg("/prayers", chat_id=333, user_id=333)
 p = last_text(333)
 assert "&lt;on&gt;" in p and "<script>" not in p, p
+assert "📅 17 Aug 2026" in p, p
 
 # --- 4. /groupid works in a group (with mention) ---
 msg("/groupid@test_prayer_bot", chat_id=-100555, user_id=444, chat_type="supergroup")

@@ -104,6 +104,7 @@ def finish_request(user_id, chat_id, share):
         return
 
     no = res["no"]
+    date_str = html.escape(str(res.get("date") or ""))
     verse, ref = random.choice(VERSES)
     name_label = "Anonymous" if s.get("anonymous") else html.escape(s["name"])
 
@@ -120,8 +121,9 @@ def finish_request(user_id, chat_id, share):
             return
         support_line = (f"\n💡 <i>How we can support:</i> {html.escape(s['support'])}"
                         if s.get("support") else "")
+        date_tag = f" · 📅 {date_str}" if date_str else ""
         group_msg = (
-            f"🙏 <b>New prayer request #{no}</b>\n\n"
+            f"🙏 <b>New prayer request #{no}</b>{date_tag}\n\n"
             f"<b>Name:</b> {name_label}\n"
             f"<b>Praying for:</b> {html.escape(s['topic'])}\n\n"
             f"“{html.escape(s['request'])}”{support_line}\n\n"
@@ -179,7 +181,9 @@ def handle_message(msg):
                 name = html.escape(str(it.get("name") or "Anonymous"))
                 topic = html.escape(str(it.get("topic") or ""))
                 req = html.escape(str(it.get("request") or ""))
-                lines.append(f"#{it.get('no')} · {name} — {topic}\n“{req}”\n")
+                date = html.escape(str(it.get("date") or ""))
+                when = f" · 📅 {date}" if date else ""
+                lines.append(f"#{it.get('no')} · {name} — {topic}{when}\n“{req}”\n")
             send(chat_id, "\n".join(lines), parse_mode="HTML")
             return
 
