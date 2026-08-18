@@ -1,4 +1,4 @@
-"""Church cell prayer request Telegram bot.
+"""Church lifegroup prayer request Telegram bot.
 
 Flow: /start -> name (or anonymous) -> topic -> request -> support -> share?
 Saves each request to the Google Sheet via an Apps Script web app,
@@ -84,7 +84,7 @@ def start_flow(user_id, chat_id):
     pending[user_id] = {"step": ASK_NAME, "ts": time.time()}
     send(chat_id,
          "I'd love to help you share a prayer request. 🙏\n\n"
-         "First — what should we call you?\n"
+         "First — how should I address you?\n"
          "(Type your name, or 'anonymous' if you'd rather keep it private.)")
 
 
@@ -142,6 +142,14 @@ def handle_message(msg):
     if not user_id:
         return
 
+    is_private = chat.get("type") == "private"
+
+    # In groups, stay silent unless the bot is mentioned (@username).
+    # Commands addressed to us (e.g. /prayers@botname) contain the mention too.
+    if not is_private and BOT_USERNAME:
+        if f"@{BOT_USERNAME}".lower() not in text.lower():
+            return
+
     # ----- commands -----
     if text.startswith("/"):
         cmd = text.split()[0].lower().split("@")[0]
@@ -181,17 +189,25 @@ def handle_message(msg):
 
         elif cmd == "/help":
             send(chat_id,
-                 "🙏 I help our cell group share prayer requests.\n\n"
+                 "🙏 I help our life group share prayer requests.\n\n"
                  "/start — share a new prayer request (you can stay anonymous)\n"
                  "/prayers — see the most recent requests\n"
                  "/groupid — show this chat's id (for setup)\n\n"
-                 "Just send /start and I'll walk you through it, step by step.")
+                 "Just send /start and I'll walk you through it, step by step." +
+                 (f"\n\nIn our group chat, mention me first — e.g. @{BOT_USERNAME} /prayers."
+                  if BOT_USERNAME else ""))
             return
 
         else:
             return  # unknown command, ignore
 
-    # ----- conversation flow -----
+    # ----- plain-text mention in a group -> point to private chat -----
+    if not is_private:
+        tg("sendMessage", chat_id=chat_id,
+           text=f"Hi! To share a prayer request privately, message me directly:\nhttps://t.me/{BOT_USERNAME}")
+        return
+
+    # ----- conversation flow (private chats only) -----
     s = pending.get(user_id)
     if not s:
         tg("sendMessage", chat_id=chat_id,

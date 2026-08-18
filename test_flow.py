@@ -85,13 +85,13 @@ msg("/prayers", chat_id=333, user_id=333)
 p = last_text(333)
 assert "&lt;on&gt;" in p and "<script>" not in p, p
 
-# --- 4. /groupid works in a group ---
-msg("/groupid", chat_id=-100555, user_id=444, chat_type="supergroup")
+# --- 4. /groupid works in a group (with mention) ---
+msg("/groupid@test_prayer_bot", chat_id=-100555, user_id=444, chat_type="supergroup")
 g = last_text(-100555)
 assert "-100555" in g, g
 
-# --- 5. /start in a group redirects to private chat ---
-msg("/start", chat_id=-100555, user_id=444, chat_type="supergroup")
+# --- 5. /start in a group redirects to private chat (with mention) ---
+msg("/start@test_prayer_bot", chat_id=-100555, user_id=444, chat_type="supergroup")
 r = last_text(-100555)
 assert "t.me/test_prayer_bot" in r, r
 
@@ -105,6 +105,14 @@ good = client.post("/webhook", json={"message": {"chat": {"id": 555, "type": "pr
                                                 "from": {"id": 555}, "text": "/help"}},
                    headers={"X-Telegram-Bot-Api-Secret-Token": "whsec"})
 assert good.status_code == 200 and last_text(555).startswith("🙏"), good.status_code
+
+# --- 7. group: silent without mention; plain-text mention -> DM pointer ---
+n_before = len(calls)
+msg("hello everyone, how are we?", chat_id=-100555, user_id=444, chat_type="supergroup")
+assert len(calls) == n_before, "bot must stay silent in groups without a mention"
+msg("@test_prayer_bot can you help me?", chat_id=-100555, user_id=444, chat_type="supergroup")
+p = last_text(-100555)
+assert "t.me/test_prayer_bot" in p and "privately" in p, p
 
 print("ALL TESTS PASSED ✅")
 print("\n--- sample group post (user 1) ---")
