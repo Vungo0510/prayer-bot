@@ -8,6 +8,7 @@ import html
 import logging
 import os
 import random
+import re
 import time
 
 import requests
@@ -28,7 +29,8 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 log = logging.getLogger("prayer-bot")
 
 # ---------- conversation state (in-memory; fine for a single-worker deploy) ----------
-ASK_NAME, ASK_TOPIC, ASK_REQUEST, ASK_SUPPORT, ASK_SHARE = range(5)
+ASK_NAME, ASK_TOPIC, ASK_REQUEST, ASK_SUPPORT, ASK_SHARE, \
+REACT_IDENTITY, REACT_NAME, REACT_MESSAGE = range(8)
 pending: dict[int, dict] = {}   # user_id -> {step, name, anonymous, topic, request, support, ts}
 STALE_AFTER = 24 * 3600         # drop half-finished conversations after a day
 
@@ -80,6 +82,87 @@ def cleanup_stale():
         del pending[uid]
 
 
+# ---------- read tracking & encouragement ----------
+def get_prayer(no):
+    """Fetch one prayer by its number from the recent list (or None)."""
+    res = sheet_call("recent")
+    for it in res.get("items", []):
+        if str(it.get("no")) == str(no):
+            return it
+    return None
+
+
+def mark_reads(items, user_id):
+    """Record that user_id saw these prayers; DM each submitter at most once a day.
+
+    The reader stays anonymous to the submitter — they only learn that
+    *someone* read the prayer. Self-reads are ignored (no notification).
+    """
+    today = time.strftime("%Y-%m-%d")
+    for it in items:
+        try:
+            no = int(it.get("no"))
+        except (TypeError, ValueError):
+            continue
+        submitter_id = str(it.get("submitter_id") or "").strip()
+        if not submitter_id or submitter_id == str(user_id):
+            continue  # nothing to notify / it's their own prayer
+        readers = [r.strip() for r in str(it.get("readers") or "").split(",") if r.strip()]
+        if str(user_id) in readers:
+            continue  # already credited this reader
+        should_notify = str(it.get("last_read_notify") or "") != today
+        try:
+            sheet_call("mark_read", no=no, reader_id=user_id,
+                       notify_date=today if should_notify else "")
+        except Exception:
+            log.warning("mark_read failed for prayer #%s", no)
+            continue
+        if should_notify:
+            try:
+                send(int(submitter_id),
+                     f"👁 Someone has read your prayer request #{no}.\n\n"
+                     "They're carrying you in their prayers. 🕊️")
+            except Exception:
+                log.warning("read notification failed for prayer #%s", no)
+
+
+def start_encouragement(user_id, kind, no):
+    """Reader tapped 🙏 on prayer #no in the list; continue privately with them.
+
+    kind is None (pick identity), 'anon', or 'named'. All follow-up happens in a
+    private chat so the reader's choice isn't announced publicly.
+    """
+    try:
+        it = get_prayer(no)
+    except Exception:
+        log.exception("sheet recent failed during encouragement")
+        send(user_id, "⚠️ I couldn't reach the prayer list just now. Please try again.")
+        return
+    if not it:
+        send(user_id, f"That prayer #{no} isn't in the recent list anymore.")
+        return
+    if str(it.get("submitter_id")) == str(user_id):
+        send(user_id, f"That's your own prayer #{no} 🙂")
+        return
+    # Note: this replaces any half-finished flow for this user (they can /start again).
+    base = {"react_no": no, "ts": time.time()}
+    if kind is None:
+        pending[user_id] = {**base, "step": REACT_IDENTITY}
+        name = html.escape(str(it.get("name") or "Anonymous"))
+        topic = html.escape(str(it.get("topic") or ""))
+        send(user_id, f"You're about to encourage {name}'s prayer #{no} ({topic}).\n\n"
+                      "How would you like to appear?", parse_mode="HTML",
+             reply_markup={"inline_keyboard": [[
+                 {"text": "🤫 Anonymously", "callback_data": f"react_anon_{no}"},
+                 {"text": "✍️ With my name", "callback_data": f"react_named_{no}"}]]})
+    elif kind == "anon":
+        pending[user_id] = {**base, "step": REACT_MESSAGE, "anonymous": True}
+        send(user_id, "Type a short word of encouragement — or 'skip' to just pray for them silently 🙏")
+    else:  # named
+        pending[user_id] = {**base, "step": REACT_NAME, "anonymous": False}
+        send(user_id, "What name should they see? (It'll show in the message I send them.)")
+
+
 def start_flow(user_id, chat_id):
     pending[user_id] = {"step": ASK_NAME, "ts": time.time()}
     send(chat_id,
@@ -94,7 +177,8 @@ def finish_request(user_id, chat_id, share):
         return
     try:
         res = sheet_call("add", name=s.get("name") or "Anonymous", topic=s["topic"],
-                         request=s["request"], update="", support=s.get("support", ""))
+                         request=s["request"], update="", support=s.get("support", ""),
+                         submitter_id=user_id)
     except Exception:
         log.exception("sheet add failed")
         send(chat_id, "⚠️ Sorry, I couldn't save your request just now. Please try again in a moment.")
@@ -147,10 +231,12 @@ def handle_message(msg):
     is_private = chat.get("type") == "private"
 
     # In groups, stay silent unless the bot is mentioned (@username).
-    # Commands addressed to us (e.g. /prayers@botname) contain the mention too.
+    # Commands addressed to us (e.g. /prayers@botname) contain the mention too;
+    # strip it so "@bot /prayers" also parses as "/prayers".
     if not is_private and BOT_USERNAME:
         if f"@{BOT_USERNAME}".lower() not in text.lower():
             return
+        text = re.sub(rf"(?i)@\s*{re.escape(BOT_USERNAME)}\b", "", text).strip()
 
     # ----- commands -----
     if text.startswith("/"):
@@ -176,15 +262,24 @@ def handle_message(msg):
             if not items:
                 send(chat_id, "No prayer requests yet. Be the first! 🙏 (send /start)")
                 return
+            shown = items[:5]  # newest first — only what's displayed counts as read
+            mark_reads(shown, user_id)  # credit this reader + notify submitters (once/day each)
             lines = ["📖 <b>Recent prayer requests</b>\n"]
-            for it in items[:5]:  # newest first
+            keyboard = []
+            for it in shown:
                 name = html.escape(str(it.get("name") or "Anonymous"))
                 topic = html.escape(str(it.get("topic") or ""))
                 req = html.escape(str(it.get("request") or ""))
                 date = html.escape(str(it.get("date") or ""))
                 when = f" · 📅 {date}" if date else ""
-                lines.append(f"#{it.get('no')} · {name} — {topic}{when}\n“{req}”\n")
-            send(chat_id, "\n".join(lines), parse_mode="HTML")
+                readers = [r for r in str(it.get("readers") or "").split(",") if r.strip()]
+                eyes = f" · 👁 {len(readers)}" if readers else ""
+                lines.append(f"#{it.get('no')} · {name} — {topic}{when}{eyes}\n“{req}”\n")
+                keyboard.append([{"text": f"🙏 #{it.get('no')}",
+                                  "callback_data": f"react_{it.get('no')}"}])
+            lines.append("Tap 🙏 on a prayer to encourage its author — privately, anonymous or with your name.")
+            send(chat_id, "\n".join(lines), parse_mode="HTML",
+                 reply_markup={"inline_keyboard": keyboard})
             return
 
         elif cmd == "/groupid":
@@ -197,7 +292,8 @@ def handle_message(msg):
                  "/start — share a new prayer request (you can stay anonymous)\n"
                  "/prayers — see the most recent requests\n"
                  "/groupid — show this chat's id (for setup)\n\n"
-                 "Just send /start and I'll walk you through it, step by step." +
+                 "Just send /start and I'll walk you through it, step by step.\n\n"
+                 "Tap 🙏 under any prayer in the list to encourage its author privately — anonymous or with your name." +
                  (f"\n\nIn our group chat, mention me first — e.g. @{BOT_USERNAME} /prayers."
                   if BOT_USERNAME else ""))
             return
@@ -263,10 +359,44 @@ def handle_message(msg):
         low = text.lower()
         finish_request(user_id, chat_id, share=("yes" in low) or ("share" in low))
 
+    elif step == REACT_NAME:
+        s["react_name"] = text[:50]
+        s["step"] = REACT_MESSAGE
+        send(chat_id, "Type a short word of encouragement — or 'skip' to just pray for them silently 🙏")
+
+    elif step == REACT_MESSAGE:
+        if not text:
+            send(chat_id, "Type a short word of encouragement — or 'skip' to just pray for them silently 🙏")
+            return
+        message = "" if text.lower() in ("skip", "-", "none", "no") else text[:300]
+        no, anon = s["react_no"], bool(s.get("anonymous"))
+        name = (s.get("react_name") or "").strip() or "A friend"
+        pending.pop(user_id, None)
+        try:
+            it = get_prayer(no)
+        except Exception:
+            log.exception("sheet recent failed during encouragement")
+            send(chat_id, "⚠️ I couldn't find that prayer just now. Please try again.")
+            return
+        submitter_id = str((it or {}).get("submitter_id") or "").strip()
+        if not submitter_id:
+            send(chat_id, f"⚠️ Prayer #{no} has no contact to notify (it may predate this feature).")
+            return
+        who = "Someone" if anon else name
+        body = (f'💬 {who} left an encouragement on your prayer #{no}:\n\n“{message}”'
+                if message else f"🙏 {who} prayed over your request #{no}. You're not alone in this.")
+        try:
+            send(int(submitter_id), body)
+            send(chat_id, "Sent 🕊️ They'll receive it as a private message from me.")
+        except Exception:
+            log.exception("encouragement delivery failed for prayer #%s", no)
+            send(chat_id, "⚠️ I couldn't deliver that just now (they may have blocked me). Please try again later.")
+
 
 def handle_callback(cb):
     user_id = cb["from"]["id"]
-    chat_id = (cb.get("message") or cb.get("chat") or {}).get("chat", {}).get("id") or cb.get("chat", {}).get("id")
+    msg_or_inline = cb.get("message") or {}
+    chat_id = (msg_or_inline.get("chat") or {}).get("id") or (cb.get("chat") or {}).get("id")
     data = cb.get("data", "")
     try:
         tg("answerCallbackQuery", callback_query_id=cb["id"])
@@ -281,6 +411,11 @@ def handle_callback(cb):
         s = pending.get(user_id)
         if s and s["step"] == ASK_SHARE:
             finish_request(user_id, chat_id, share=(data == "share_yes"))
+
+    elif data.startswith("react_"):
+        m = re.fullmatch(r"react_(?:(anon|named)_)?(\d+)", data)
+        if m:
+            start_encouragement(user_id, m.group(1), int(m.group(2)))
 
 # ---------- web endpoints ----------
 @app.get("/health")

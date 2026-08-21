@@ -1,6 +1,8 @@
 const SHEET_NAME = 'Sheet1'; // change if your tab has another name
 const SECRET = 'PASTE_A_LONG_RANDOM_STRING_HERE'; // must match bot config (keep your existing value!)
 const REQUIRED_HEADERS = ['No.', 'Name', 'I want to pray for', 'Prayer request', 'Update', 'How can others support you?'];
+// Optional bookkeeping columns, added automatically by ensureExtraHeaders_().
+const EXTRA_HEADERS = ['Submitter ID', 'Readers', 'Last read notify'];
 
 function getSheet_() {
   const ss = SpreadsheetApp.getActiveSpreadsheet();
@@ -10,7 +12,18 @@ function getSheet_() {
     sh.appendRow(REQUIRED_HEADERS.concat(['Date']));
     sh.setFrozenRows(1);
   }
+  ensureExtraHeaders_(sh);
   return sh;
+}
+
+// Add the optional bookkeeping columns on the fly so existing sheets upgrade in place.
+function ensureExtraHeaders_(sh) {
+  const map = headerMap_(sh);
+  for (let i = 0; i < EXTRA_HEADERS.length; i++) {
+    if (!map[EXTRA_HEADERS[i].toLowerCase()]) {
+      sh.getRange(1, sh.getLastColumn() + 1).setValue(EXTRA_HEADERS[i]);
+    }
+  }
 }
 
 // Map header name (trimmed, lowercased) -> column number.
@@ -67,6 +80,10 @@ function doPost(e) {
       row[map['update'] - 1] = body.update || '';
       row[map['how can others support you?'] - 1] = body.support || '';
 
+      if (map['submitter id']) {
+        row[map['submitter id'] - 1] = body.submitter_id != null ? String(body.submitter_id) : '';
+      }
+
       const dateStr = dateDisplay_();
       sh.appendRow(row);
       if (map['date']) {
@@ -95,9 +112,36 @@ function doPost(e) {
         items.push({ no: getCell_(map, vals, 'no.'), name: getCell_(map, vals, 'name'),
                      topic: getCell_(map, vals, 'i want to pray for'),
                      request: getCell_(map, vals, 'prayer request'), update: getCell_(map, vals, 'update'),
-                     support: getCell_(map, vals, 'how can others support you?'), date: date });
+                     support: getCell_(map, vals, 'how can others support you?'), date: date,
+                     submitter_id: getCell_(map, vals, 'submitter id'),
+                     readers: getCell_(map, vals, 'readers'),
+                     last_read_notify: getCell_(map, vals, 'last read notify') });
       }
       return jsonOut_({ ok: true, items: items });
+    }
+
+    if (body.action === 'mark_read') {
+      const sh = getSheet_();
+      const map = headerMap_(sh);
+      if (!map['readers']) return jsonOut_({ ok: false, error: "sheet is missing the 'Readers' column" });
+      const noNum = Number(body.no);
+      const readerId = String(body.reader_id || '');
+      const last = sh.getLastRow();
+      for (let i = 2; i <= last; i++) {
+        if (Number(sh.getRange(i, map['no.']).getValue()) !== noNum) continue;
+        const cell = sh.getRange(i, map['readers']);
+        const existing = String(cell.getValue() || '');
+        const readers = existing ? existing.split(',').map(function (s) { return s.trim(); }).filter(Boolean) : [];
+        if (readerId && readers.indexOf(readerId) === -1) {
+          readers.push(readerId);
+          cell.setValue(readers.join(','));
+        }
+        if (body.notify_date && map['last read notify']) {
+          sh.getRange(i, map['last read notify']).setValue(String(body.notify_date));
+        }
+        return jsonOut_({ ok: true, count: readers.length });
+      }
+      return jsonOut_({ ok: false, error: 'prayer not found: ' + body.no });
     }
 
     return jsonOut_({ ok: false, error: 'unknown action' });
