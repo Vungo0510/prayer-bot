@@ -84,8 +84,20 @@ def cleanup_stale():
 
 # ---------- read tracking & encouragement ----------
 def get_prayer(no):
-    """Fetch one prayer by its number from the recent list (or None)."""
-    res = sheet_call("recent")
+    """Fetch one prayer by its number (or None).
+
+    Prefers an exact sheet lookup, which works even when the prayer has fallen
+    out of the recent list window. Falls back to scanning the recent list for
+    deployments whose script predates 'get_by_no'. Network errors propagate so
+    callers can offer a retry message.
+    """
+    try:
+        res = sheet_call("get_by_no", no=no)
+    except Exception:
+        res = None  # network failure — the recent call below will raise too, if it's down
+    if isinstance(res, dict) and res.get("ok") and res.get("item"):
+        return res["item"]
+    res = sheet_call("recent", limit=50)
     for it in res.get("items", []):
         if str(it.get("no")) == str(no):
             return it
@@ -126,11 +138,12 @@ def mark_reads(items, user_id):
                 log.warning("read notification failed for prayer #%s", no)
 
 
-def start_encouragement(user_id, kind, no):
+def start_encouragement(user_id, kind, no, origin_chat=None, origin_user=None):
     """Reader tapped 🙏 on prayer #no in the list; continue privately with them.
 
     kind is None (pick identity), 'anon', or 'named'. All follow-up happens in a
-    private chat so the reader's choice isn't announced publicly.
+    private chat so the reader's choice isn't announced publicly. If the tap came
+    from a group chat, we let them know there that they've been messaged privately.
     """
     try:
         it = get_prayer(no)
@@ -155,6 +168,16 @@ def start_encouragement(user_id, kind, no):
              reply_markup={"inline_keyboard": [[
                  {"text": "🤫 Anonymously", "callback_data": f"react_anon_{no}"},
                  {"text": "✍️ With my name", "callback_data": f"react_named_{no}"}]]})
+        # The follow-up needs their input privately — tell them in the group.
+        if origin_chat and origin_chat.get("type") != "private" and origin_chat.get("id"):
+            who = html.escape((origin_user or {}).get("first_name") or "there")
+            try:
+                send(origin_chat["id"],
+                     f'🔒 <b><a href="tg://user?id={user_id}">{who}</a></b> — I\'ve just sent you a '
+                     f"private message about prayer #{no}. Please check your DMs to continue.",
+                     parse_mode="HTML")
+            except Exception:
+                log.warning("could not post the private-chat notice to chat %s", origin_chat.get("id"))
     elif kind == "anon":
         pending[user_id] = {**base, "step": REACT_MESSAGE, "anonymous": True}
         send(user_id, "Type a short word of encouragement — or 'skip' to just pray for them silently 🙏")
@@ -220,6 +243,45 @@ def finish_request(user_id, chat_id, share):
             send(chat_id, "Note: I couldn't post to the group — check that I've been added to it.")
 
 
+# ---------- /prayers list options ----------
+DEFAULT_LIST_COUNT = 10   # how many recent prayers /prayers shows by default
+MAX_LIST_COUNT = 50       # hard cap for --number N
+TG_MSG_LIMIT = 4000       # Telegram allows 4096 chars per message; leave headroom
+LIST_FOOTER = ("Tap 🙏 on a prayer to encourage its author — "
+               "privately, anonymous or with your name.")
+
+
+def parse_prayer_count(text):
+    """Parse /prayers arguments. Returns (count, error_message).
+
+    Accepts '/prayers', '/prayers --number N' ('--number=N') and bare '/prayers N'.
+    """
+    tokens = text.split()[1:]
+    val = None
+    i = 0
+    while i < len(tokens):
+        tok = tokens[i]
+        if tok.lower() == "--number":
+            if i + 1 >= len(tokens):
+                return None, f"Usage: /prayers --number N (N is between 1 and {MAX_LIST_COUNT})"
+            i += 1
+            val = tokens[i]
+        elif tok.lower().startswith("--number="):
+            val = tok.split("=", 1)[1]
+        elif re.fullmatch(r"\d+", tok) and val is None:
+            val = tok
+        i += 1
+    if val is None:
+        return DEFAULT_LIST_COUNT, None
+    try:
+        n = int(val)
+    except ValueError:
+        return None, f"'{val}' isn't a number. Usage: /prayers --number N"
+    if not 1 <= n <= MAX_LIST_COUNT:
+        return None, f"N must be between 1 and {MAX_LIST_COUNT}. Usage: /prayers --number N"
+    return n, None
+
+
 def handle_message(msg):
     chat = msg.get("chat", {})
     user = msg.get("from", {})
@@ -252,9 +314,14 @@ def handle_message(msg):
             return
 
         elif cmd == "/prayers":
+            count, err = parse_prayer_count(text)
+            if err:
+                send(chat_id, err)
+                return
             try:
-                res = sheet_call("recent")
-                items = res.get("items", [])
+                res = sheet_call("recent", limit=count)
+                # newest first — only what's displayed counts as read
+                items = res.get("items", [])[:count]
             except Exception:
                 log.exception("sheet recent failed")
                 send(chat_id, "⚠️ Couldn't reach the prayer list right now.")
@@ -262,11 +329,10 @@ def handle_message(msg):
             if not items:
                 send(chat_id, "No prayer requests yet. Be the first! 🙏 (send /start)")
                 return
-            shown = items[:5]  # newest first — only what's displayed counts as read
-            mark_reads(shown, user_id)  # credit this reader + notify submitters (once/day each)
-            lines = ["📖 <b>Recent prayer requests</b>\n"]
-            keyboard = []
-            for it in shown:
+            mark_reads(items, user_id)  # credit this reader + notify submitters (once/day each)
+
+            entries = []
+            for it in items:
                 name = html.escape(str(it.get("name") or "Anonymous"))
                 topic = html.escape(str(it.get("topic") or ""))
                 req = html.escape(str(it.get("request") or ""))
@@ -274,12 +340,28 @@ def handle_message(msg):
                 when = f" · 📅 {date}" if date else ""
                 readers = [r for r in str(it.get("readers") or "").split(",") if r.strip()]
                 eyes = f" · 👁 {len(readers)}" if readers else ""
-                lines.append(f"#{it.get('no')} · {name} — {topic}{when}{eyes}\n“{req}”\n")
-                keyboard.append([{"text": f"🙏 #{it.get('no')}",
-                                  "callback_data": f"react_{it.get('no')}"}])
-            lines.append("Tap 🙏 on a prayer to encourage its author — privately, anonymous or with your name.")
-            send(chat_id, "\n".join(lines), parse_mode="HTML",
-                 reply_markup={"inline_keyboard": keyboard})
+                entries.append((f"#{it.get('no')} · {name} — {topic}{when}{eyes}\n“{req}”\n",
+                                [{"text": f"🙏 #{it.get('no')}",
+                                  "callback_data": f"react_{it.get('no')}"}]))
+
+            # A long list can exceed Telegram's message size limit, so split it into
+            # several messages — each keeps the 🙏 buttons for its own prayers.
+            header = "📖 <b>Recent prayer requests</b>\n"
+            chunks, cur_lines, cur_btns, cur_len = [], [header], [], len(header)
+            for entry_text, btn_row in entries:
+                if cur_btns and cur_len + len(entry_text) > TG_MSG_LIMIT:
+                    chunks.append(("\n".join(cur_lines), cur_btns))
+                    cur_lines, cur_btns, cur_len = [header], [], len(header)
+                cur_lines.append(entry_text)
+                cur_btns.append(btn_row)
+                cur_len += len(entry_text)
+            chunks.append(("\n".join(cur_lines), cur_btns))
+
+            for i, (body, keyboard) in enumerate(chunks):
+                body += ("\n" + LIST_FOOTER if i == len(chunks) - 1
+                         else "\n<i>…continued below</i>")
+                send(chat_id, body, parse_mode="HTML",
+                     reply_markup={"inline_keyboard": keyboard})
             return
 
         elif cmd == "/groupid":
@@ -290,10 +372,12 @@ def handle_message(msg):
             send(chat_id,
                  "🙏 I help our life group share prayer requests.\n\n"
                  "/start — share a new prayer request (you can stay anonymous)\n"
-                 "/prayers — see the most recent requests\n"
+                 f"/prayers — see the {DEFAULT_LIST_COUNT} most recent requests "
+                 f"(use /prayers --number N for up to {MAX_LIST_COUNT})\n"
                  "/groupid — show this chat's id (for setup)\n\n"
                  "Just send /start and I'll walk you through it, step by step.\n\n"
-                 "Tap 🙏 under any prayer in the list to encourage its author privately — anonymous or with your name." +
+                 "Tap 🙏 under any prayer in the list to encourage its author privately — anonymous or with your name."
+                 "\nIf that happens from our group chat, I'll message you privately and let everyone know here to check their DMs." +
                  (f"\n\nIn our group chat, mention me first — e.g. @{BOT_USERNAME} /prayers."
                   if BOT_USERNAME else ""))
             return
@@ -311,7 +395,9 @@ def handle_message(msg):
     s = pending.get(user_id)
     if not s:
         tg("sendMessage", chat_id=chat_id,
-           text="Hi! 🙏 I'm the prayer request bot.\nSend /start to share a prayer request, or /prayers to see recent ones.",
+           text="Hi! 🙏 I'm the prayer request bot.\n"
+                "Send /start to share a prayer request, or /prayers to see recent ones.\n"
+                "Not sure what I can do? Send /help any time.",
            reply_markup={"inline_keyboard": [[{"text": "🙏 Share a prayer request", "callback_data": "new"}]]})
         return
 
@@ -375,10 +461,13 @@ def handle_message(msg):
         try:
             it = get_prayer(no)
         except Exception:
-            log.exception("sheet recent failed during encouragement")
+            log.exception("sheet lookup failed during encouragement")
             send(chat_id, "⚠️ I couldn't find that prayer just now. Please try again.")
             return
-        submitter_id = str((it or {}).get("submitter_id") or "").strip()
+        if not it:
+            send(chat_id, f"⚠️ Prayer #{no} isn't in the sheet anymore — nothing to encourage right now.")
+            return
+        submitter_id = str(it.get("submitter_id") or "").strip()
         if not submitter_id:
             send(chat_id, f"⚠️ Prayer #{no} has no contact to notify (it may predate this feature).")
             return
@@ -415,7 +504,9 @@ def handle_callback(cb):
     elif data.startswith("react_"):
         m = re.fullmatch(r"react_(?:(anon|named)_)?(\d+)", data)
         if m:
-            start_encouragement(user_id, m.group(1), int(m.group(2)))
+            origin_chat = msg_or_inline.get("chat") or cb.get("chat") or {}
+            start_encouragement(user_id, m.group(1), int(m.group(2)),
+                                origin_chat=origin_chat, origin_user=cb.get("from"))
 
 # ---------- web endpoints ----------
 @app.get("/health")

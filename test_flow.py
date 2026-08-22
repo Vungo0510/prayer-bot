@@ -18,12 +18,25 @@ def fake_tg(method, **kw):
     return True
 
 
-# In-memory stand-in for the Google Sheet (the /prayers recent list).
+# In-memory stand-in for the Google Sheet (the /prayers recent list), newest first.
 SHEET_ROWS = [
     {"no": 7, "name": "Grace", "topic": "health", "request": "Mum's surgery <on> Friday",
      "update": "", "support": "check in", "date": "17 Aug 2026",
      "submitter_id": "111", "readers": "", "last_read_notify": ""},
+    {"no": 6, "name": "Daniel", "topic": "job interview", "request": "Please pray for my interview on Monday.",
+     "update": "", "support": "", "date": "18 Aug 2026",
+     "submitter_id": "222", "readers": "", "last_read_notify": ""},
+    {"no": 5, "name": "Ruth", "topic": "family", "request": "Our family is going through a hard season.",
+     "update": "", "support": "", "date": "19 Aug 2026",
+     "submitter_id": "333", "readers": "", "last_read_notify": ""},
+    # Predates the Submitter ID feature — no contact to notify.
+    {"no": 4, "name": "Sam", "topic": "health", "request": "Pray for my recovery.",
+     "update": "", "support": "", "date": "20 Aug 2026",
+     "submitter_id": "", "readers": "", "last_read_notify": ""},
 ]
+
+# When True, fake_sheet pretends to be a pre-feature deployment (no get_by_no action).
+OLD_SCRIPT_MODE = False
 
 
 def fake_sheet(action, **fields):
@@ -31,7 +44,16 @@ def fake_sheet(action, **fields):
     if action == "add":
         return {"ok": True, "no": 7, "date": "17 Aug 2026"}
     if action == "recent":
-        return {"ok": True, "items": [dict(r) for r in SHEET_ROWS]}
+        limit = int(fields.get("limit") or 10)
+        rows = sorted(SHEET_ROWS, key=lambda r: -int(r["no"]))[:limit]
+        return {"ok": True, "items": [dict(r) for r in rows]}
+    if action == "get_by_no":
+        if OLD_SCRIPT_MODE:
+            return {"ok": False, "error": "unknown action"}  # old deployment
+        row = next((r for r in SHEET_ROWS if str(r["no"]) == str(fields.get("no"))), None)
+        if row is None:
+            return {"ok": False, "error": f"prayer not found: {fields.get('no')}"}
+        return {"ok": True, "item": dict(row)}
     if action == "mark_read":
         row = next((r for r in SHEET_ROWS if str(r["no"]) == str(fields.get("no"))), None)
         assert row is not None, f"no prayer #{fields.get('no')}"
@@ -149,13 +171,14 @@ p = last_text(-100555)
 assert "t.me/test_prayer_bot" in p and "privately" in p, p
 
 # --- 8. read notifications: reader credited once, submitter notified once/day, no self-notify ---
-SHEET_ROWS[0].update(readers="", last_read_notify="")
+for r in SHEET_ROWS:                                   # clean slate for all rows
+    r.update(readers="", last_read_notify="")
 n_dm = len(dms_to(111))
 msg("@test_prayer_bot /prayers", chat_id=-100555, user_id=444, chat_type="supergroup")
 lst = last_text(-100555)
 assert "Recent prayer requests" in lst and "👁" not in lst, lst
 btns = [b["callback_data"] for row in last_kwargs(-100555)["reply_markup"]["inline_keyboard"] for b in row]
-assert btns == ["react_7"], btns                       # 🙏 encourage button offered
+assert btns == ["react_7", "react_6", "react_5", "react_4"], btns   # 🙏 button per shown prayer
 note = last_text(111)
 assert "#7" in note and "Someone has read" in note and "444" not in note, note  # reader stays anonymous
 assert SHEET_ROWS[0]["readers"] == "444", SHEET_ROWS[0]
@@ -202,6 +225,115 @@ assert enc.startswith("💬 Peter") and "prayer #7" in enc and "<3" in enc, enc
 bot.handle_callback({"id": "cb7", "from": {"id": 111}, "data": "react_7",
                      "message": {"chat": {"id": -100555, "type": "supergroup"}}})
 assert "your own prayer" in last_text(111), last_text(111)
+
+# --- 12. /prayers --number N (default is now 10; sheet receives the limit) ---
+def recent_limits():
+    return [f.get("limit") for a, f in sheet_calls if a == "recent"]
+
+msg("/prayers", chat_id=333, user_id=333)          # no flag -> default 10 requested
+assert recent_limits()[-1] == bot.DEFAULT_LIST_COUNT == 10, recent_limits()
+
+msg("/prayers --number 2", chat_id=333, user_id=333)
+p = last_text(333)
+assert "#7" in p and "#6" in p and "#5" not in p and "#4" not in p, p
+btns = [b["callback_data"] for row in last_kwargs(333)["reply_markup"]["inline_keyboard"] for b in row]
+assert btns == ["react_7", "react_6"], btns
+assert recent_limits()[-1] == 2, recent_limits()
+
+msg("/prayers --number=1", chat_id=333, user_id=333)     # = form works too
+p = last_text(333)
+assert "#7" in p and "#6" not in p, p
+
+msg("/prayers 3", chat_id=333, user_id=333)              # bare number as a convenience
+btns = [b["callback_data"] for row in last_kwargs(333)["reply_markup"]["inline_keyboard"] for b in row]
+assert btns == ["react_7", "react_6", "react_5"], btns
+
+msg("/prayers --number abc", chat_id=333, user_id=333)
+assert "isn't a number" in last_text(333), last_text(333)
+
+msg("/prayers --number 999", chat_id=333, user_id=333)
+assert f"between 1 and {bot.MAX_LIST_COUNT}" in last_text(333), last_text(333)
+
+# --- 13. long lists are split into Telegram-sized messages (each keeps its own buttons) ---
+saved_limit = bot.TG_MSG_LIMIT
+bot.TG_MSG_LIMIT = 150          # force chunking with the small test data
+n_before = len(calls)
+msg("/prayers", chat_id=888, user_id=888)
+new_calls = [c for c in calls[n_before:] if c[1].get("chat_id") == 888]
+bot.TG_MSG_LIMIT = saved_limit
+assert len(new_calls) >= 2, f"expected chunked list, got {len(new_calls)} message(s)"
+for m, kw in new_calls:
+    assert len(kw["text"]) < 4096, "chunk must fit Telegram's limit"
+last_body = new_calls[-1][1]["text"]
+earlier = [kw["text"] for _, kw in new_calls[:-1]]
+assert bot.LIST_FOOTER.split("—")[0] in last_body, last_body     # footer only on final chunk
+assert all("continued below" in t for t in earlier), earlier
+all_btns = [b["callback_data"] for _, kw in new_calls
+            for row in (kw.get("reply_markup") or {}).get("inline_keyboard", []) for b in row]
+assert sorted(all_btns) == ["react_4", "react_5", "react_6", "react_7"], all_btns
+
+# --- 14. greeting tells users about /help ---
+msg("hello there", chat_id=777, user_id=777)
+g = last_text(777)
+assert "/help" in g and "I'm the prayer request bot" in g, g
+msg("/help", chat_id=777, user_id=777)
+h = last_text(777)
+assert "--number" in h and str(bot.DEFAULT_LIST_COUNT) in h, h
+
+# --- 15. group tap -> reader is told (in-group) they've been messaged privately ---
+bot.handle_callback({"id": "cb20", "from": {"id": 444, "first_name": "Peter"}, "data": "react_6",
+                     "message": {"chat": {"id": -100555, "type": "supergroup"}}})
+assert "How would you like to appear" in last_text(444), last_text(444)
+notice = last_text(-100555)
+assert "private message" in notice and "prayer #6" in notice, notice
+assert 'tg://user?id=444' in notice and "Peter" in notice, notice
+
+n_sends = len([c for c in calls if c[0] == "sendMessage"])
+bot.handle_callback({"id": "cb21", "from": {"id": 999}, "data": "react_5",
+                     "message": {"chat": {"id": 999, "type": "private"}}})   # tap in a DM: no group noise
+assert "How would you like to appear" in last_text(999), last_text(999)
+new_sends = [c for c in calls if c[0] == "sendMessage"][n_sends:]
+assert len(new_sends) == 1 and new_sends[0][1]["chat_id"] == 999, \
+    f"only the private prompt should be sent for a private tap: {new_sends}"
+
+# --- 16. bug fix: 'no contact to notify' must not fire for prayers that do have a submitter ---
+# (a) a prayer outside the recent-10 window is still found via get_by_no and delivered
+saved_rows = [dict(r) for r in SHEET_ROWS]
+for n in range(8, 16):                     # push prayer #5 out of the latest-10 window
+    SHEET_ROWS.append({"no": n, "name": f"U{n}", "topic": "misc", "request": f"prayer {n}",
+                       "update": "", "support": "", "date": "20 Aug 2026",
+                       "submitter_id": str(900 + n), "readers": "", "last_read_notify": ""})
+res = bot.sheet_call("recent", limit=10)
+assert "5" not in [str(it["no"]) for it in res["items"]], "setup: #5 should be out of window"
+got = bot.get_prayer(5)
+assert got is not None and str(got["submitter_id"]) == "333", got   # exact lookup finds it anyway
+
+bot.handle_callback({"id": "cb40", "from": {"id": 700}, "data": "react_5",
+                     "message": {"chat": {"id": -100555, "type": "supergroup"}}})
+assert "How would you like to appear" in last_text(700), last_text(700)
+bot.handle_callback({"id": "cb41", "from": {"id": 700}, "data": "react_anon_5"})
+msg("you're not alone", chat_id=700, user_id=700)
+enc = last_text(333)
+assert enc.startswith("💬 Someone") and "#5" in enc, enc   # delivered despite being out of window
+SHEET_ROWS[:] = saved_rows
+
+# (b) a genuinely pre-feature prayer still gets the no-contact message
+bot.handle_callback({"id": "cb42", "from": {"id": 555}, "data": "react_4",
+                     "message": {"chat": {"id": -100555, "type": "supergroup"}}})
+assert "How would you like to appear" in last_text(555), last_text(555)
+bot.handle_callback({"id": "cb43", "from": {"id": 555}, "data": "react_anon_4"})
+msg("hold fast", chat_id=555, user_id=555)
+assert "no contact to notify" in last_text(555), last_text(555)
+
+# (c) a prayer that no longer exists gets the not-found message, not 'no contact'
+bot.handle_callback({"id": "cb44", "from": {"id": 800}, "data": "react_999"})
+assert "isn't in the recent list anymore" in last_text(800), last_text(800)
+
+# --- 17. old script deployment (no get_by_no action): get_prayer falls back to the recent scan ---
+OLD_SCRIPT_MODE = True
+got = bot.get_prayer(7)
+assert got is not None and str(got["no"]) == "7" and str(got["submitter_id"]) == "111", got
+OLD_SCRIPT_MODE = False
 
 print("ALL TESTS PASSED ✅")
 print("\n--- sample group post (user 1) ---")

@@ -48,6 +48,23 @@ function getCell_(map, vals, h) {
   return c ? vals[c - 1] : '';
 }
 
+// Build the JSON object for one prayer row (shared by 'recent' and 'get_by_no').
+function rowItem_(map, vals, tz) {
+  let date = null;
+  if (map['date']) {
+    const d = getCell_(map, vals, 'date');
+    if (d instanceof Date) date = Utilities.formatDate(d, tz, 'dd MMM yyyy');
+    else if (String(d).trim()) date = String(d).trim(); // manually typed text
+  }
+  return { no: getCell_(map, vals, 'no.'), name: getCell_(map, vals, 'name'),
+           topic: getCell_(map, vals, 'i want to pray for'),
+           request: getCell_(map, vals, 'prayer request'), update: getCell_(map, vals, 'update'),
+           support: getCell_(map, vals, 'how can others support you?'), date: date,
+           submitter_id: getCell_(map, vals, 'submitter id'),
+           readers: getCell_(map, vals, 'readers'),
+           last_read_notify: getCell_(map, vals, 'last read notify') };
+}
+
 function jsonOut_(obj) {
   return ContentService.createTextOutput(JSON.stringify(obj)).setMimeType(ContentService.MimeType.JSON);
 }
@@ -99,25 +116,33 @@ function doPost(e) {
       const tz = SpreadsheetApp.getActiveSpreadsheet().getSpreadsheetTimeZone();
       const ncols = Math.max(sh.getLastColumn(), REQUIRED_HEADERS.length);
       const last = sh.getLastRow();
-      const count = Math.min(10, Math.max(0, last - 1));
+      // Optional limit from the bot (/prayers --number N); default 10, capped at 100.
+      const requested = Number(body.limit);
+      const want = (isFinite(requested) && requested > 0) ? Math.min(Math.floor(requested), 100) : 10;
+      const count = Math.min(want, Math.max(0, last - 1));
       const items = [];
       for (let i = last; i > last - count && i >= 2; i--) {
         const vals = sh.getRange(i, 1, 1, ncols).getValues()[0];
-        let date = null;
-        if (map['date']) {
-          const d = getCell_(map, vals, 'date');
-          if (d instanceof Date) date = Utilities.formatDate(d, tz, 'dd MMM yyyy');
-          else if (String(d).trim()) date = String(d).trim(); // manually typed text
-        }
-        items.push({ no: getCell_(map, vals, 'no.'), name: getCell_(map, vals, 'name'),
-                     topic: getCell_(map, vals, 'i want to pray for'),
-                     request: getCell_(map, vals, 'prayer request'), update: getCell_(map, vals, 'update'),
-                     support: getCell_(map, vals, 'how can others support you?'), date: date,
-                     submitter_id: getCell_(map, vals, 'submitter id'),
-                     readers: getCell_(map, vals, 'readers'),
-                     last_read_notify: getCell_(map, vals, 'last read notify') });
+        items.push(rowItem_(map, vals, tz));
       }
       return jsonOut_({ ok: true, items: items });
+    }
+
+    if (body.action === 'get_by_no') {
+      // Exact lookup by No. — works even for prayers outside the recent list window.
+      const sh = getSheet_();
+      const map = headerMap_(sh);
+      if (!map['no.']) return jsonOut_({ ok: false, error: "sheet is missing the 'No.' column" });
+      const target = Number(body.no);
+      const last = sh.getLastRow();
+      const ncols = Math.max(sh.getLastColumn(), REQUIRED_HEADERS.length);
+      const tz = SpreadsheetApp.getActiveSpreadsheet().getSpreadsheetTimeZone();
+      for (let i = 2; i <= last; i++) {
+        if (Number(sh.getRange(i, map['no.']).getValue()) !== target) continue;
+        const vals = sh.getRange(i, 1, 1, ncols).getValues()[0];
+        return jsonOut_({ ok: true, item: rowItem_(map, vals, tz) });
+      }
+      return jsonOut_({ ok: false, error: 'prayer not found: ' + body.no });
     }
 
     if (body.action === 'mark_read') {
